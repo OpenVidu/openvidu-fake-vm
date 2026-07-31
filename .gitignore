@@ -1,0 +1,6 @@
+# Generated at runtime by start.sh (SSH keypair + per-VM known_hosts).
+.ssh/
+# Registry blobs, fake-web CA + certificates (registry.sh / fake-web.sh).
+.cache/
+# Artifacts you drop in to be served by fake-web.sh — never part of the repo.
+www/

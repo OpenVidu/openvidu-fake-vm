@@ -1,0 +1,72 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Isolation profile shared by both e2e jobs: a namespace fully separate from any real
+# fake-vm, and a prebuilt image tag so ensure_image skips rebuilding.
+env:
+  FAKE_VM_NETWORK: fake-vm-ci
+  FAKE_VM_NAME_PREFIX: fake-vm-ci-
+  FAKE_VM_SUBNET: 172.31.99.0/24
+  FAKE_VM_GATEWAY: 172.31.99.1
+  FAKE_VM_IP_PREFIX: 172.31.99
+  FAKE_VM_IMAGE: openvidu-fake-vm:ci
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck -x -S warning \
+            fake-vm.sh registry.sh fake-web.sh \
+            tests/e2e/run.sh tests/e2e/profile.bash tests/e2e/test_helper.bash
+
+  e2e-smoke:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vendor bats
+        run: make bootstrap
+      - name: Build VM image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: openvidu-fake-vm:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke tier
+        run: E2E_TIER=smoke tests/e2e/run.sh
+      - name: Cleanup
+        if: always()
+        run: ./fake-vm.sh stop --all --prune || true
+
+  # Full tier (k3s / registry / fake-web) runs on every push to main and on manual dispatch.
+  # k3s inside a privileged container can be flaky on hosted runners; if it becomes noisy,
+  # add `if: github.event_name == 'workflow_dispatch'` to make it manual-only again.
+  e2e-full:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vendor bats
+        run: make bootstrap
+      - name: Build VM image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: openvidu-fake-vm:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Full tier
+        run: E2E_TIER=full tests/e2e/run.sh
+      - name: Cleanup
+        if: always()
+        run: ./fake-vm.sh stop --all --prune || true

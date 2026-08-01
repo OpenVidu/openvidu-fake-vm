@@ -34,11 +34,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-NETWORK="fake-vm"
-CACHE_NAME="fake-vm-registry-cache"
-CACHE_IP="172.30.0.2"
-DEV_NAME="fake-vm-registry"
-DEV_IP="172.30.0.3"
+# Names, network and IPs derive from the same env seams fake-vm.sh reads, so an isolated
+# stack (e.g. the e2e suite) gets its own registries on its own network/subnet without
+# colliding with a real one. Unset env = the historical defaults.
+NETWORK="${FAKE_VM_NETWORK:-fake-vm}"
+NAME_PREFIX="${FAKE_VM_NAME_PREFIX:-fake-vm-}"
+IP_PREFIX="${FAKE_VM_IP_PREFIX:-172.30.0}"
+CACHE_NAME="${NAME_PREFIX}registry-cache"
+CACHE_IP="${IP_PREFIX}.2"
+DEV_NAME="${NAME_PREFIX}registry"
+DEV_IP="${IP_PREFIX}.3"
 # The hostname VMs use for the dev registry. It is never resolved by containerd (the
 # mirror rewrites it to DEV_IP) but is also added to the VM's /etc/hosts, so the
 # reference works from every tool inside the VM. Keeping it a NAME instead of an IP
@@ -46,8 +51,10 @@ DEV_IP="172.30.0.3"
 DEV_HOST="fake-registry:5000"
 DEV_HOST_PORT="${FAKE_VM_REGISTRY_PORT:-5001}" # host-side port for pushes (localhost ⇒ HTTP ok)
 REGISTRY_IMAGE="${FAKE_VM_REGISTRY_IMAGE:-registry:2}"
-CACHE_DIR="${SCRIPT_DIR}/.cache/registry-cache"
-DEV_DIR="${SCRIPT_DIR}/.cache/registry-dev"
+# Overridable so an isolated stack keeps its blobs separate — `down --prune` then never
+# deletes a real registry's cached layers.
+CACHE_DIR="${FAKE_VM_REGISTRY_CACHE_DIR:-${SCRIPT_DIR}/.cache/registry-cache}"
+DEV_DIR="${FAKE_VM_REGISTRY_DEV_DIR:-${SCRIPT_DIR}/.cache/registry-dev}"
 
 err()  { echo "ERROR: $*" >&2; }
 info() { echo ">>> $*"; }
@@ -215,18 +222,19 @@ cmd_write() {
     local body; body="$(mktemp)"
     cmd_config > "$body"
     docker exec "$cname" mkdir -p /etc/rancher/k3s
-    docker cp "$body" "${cname}:/etc/rancher/k3s/registries.yaml" >/dev/null
+    # Write via `docker exec -i … tee`, not `docker cp`: docker cp fails on a RUNNING sysbox
+    # container ("mkdirat var/lib/rancher: directory not empty", from sysbox's implicit
+    # idmapped mounts under /var/lib), while exec works under every runtime. exec runs as
+    # root, so the files land root-owned.
+    docker exec -i "$cname" tee /etc/rancher/k3s/registries.yaml >/dev/null < "$body"
     # Same wiring for a nested Docker. Written even when Docker is not installed yet:
     # dockerd reads daemon.json when it first starts, so `get.docker.com | sh` afterwards
     # comes up already using the cache.
     cmd_docker_config > "$body"
-    chmod 0644 "$body"
     docker exec "$cname" mkdir -p /etc/docker
-    docker cp "$body" "${cname}:/etc/docker/daemon.json" >/dev/null
+    docker exec -i "$cname" tee /etc/docker/daemon.json >/dev/null < "$body"
     rm -f "$body"
-    # docker cp preserves the HOST uid; these are root-owned config files in the VM.
-    docker exec "$cname" chown root:root \
-        /etc/docker/daemon.json /etc/rancher/k3s/registries.yaml
+    docker exec "$cname" chmod 0644 /etc/docker/daemon.json /etc/rancher/k3s/registries.yaml
     # Belt and braces: the mirror rewrite means containerd never resolves the name, but
     # anything else in the VM (docker, curl, a manual `ctr` pull) then can.
     docker exec "$cname" bash -c \
@@ -277,4 +285,7 @@ main() {
     esac
 }
 
-main "$@"
+# Run main only when executed directly, not when sourced (e.g. by the test suite).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

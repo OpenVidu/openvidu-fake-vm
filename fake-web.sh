@@ -35,12 +35,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-NETWORK="fake-vm"
-WEB_NAME="fake-vm-web"
-WEB_IP="172.30.0.4"
+# Network, name and IP derive from the same env seams fake-vm.sh reads, so an isolated
+# stack (e.g. the e2e suite) gets its own web server. Unset env = the historical defaults.
+NETWORK="${FAKE_VM_NETWORK:-fake-vm}"
+WEB_NAME="${FAKE_VM_NAME_PREFIX:-fake-vm-}web"
+WEB_IP="${FAKE_VM_IP_PREFIX:-172.30.0}.4"
 WEB_IMAGE="${FAKE_WEB_IMAGE:-caddy:2-alpine}"
 WEB_ROOT="${FAKE_WEB_ROOT:-${SCRIPT_DIR}/www}"
-STATE_DIR="${SCRIPT_DIR}/.cache/fake-web"
+STATE_DIR="${FAKE_WEB_STATE_DIR:-${SCRIPT_DIR}/.cache/fake-web}"
 CADDYFILE="${STATE_DIR}/Caddyfile"
 FAKE_VM_SH="${SCRIPT_DIR}/fake-vm.sh"
 
@@ -216,4 +218,7 @@ main() {
     esac
 }
 
-main "$@"
+# Run main only when executed directly, not when sourced (e.g. by the test suite).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

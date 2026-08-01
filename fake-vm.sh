@@ -62,13 +62,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-IMAGE="openvidu-fake-vm:ubuntu-24.04"
-NETWORK="fake-vm"
-SUBNET="172.30.0.0/16"
-GATEWAY="172.30.0.1"
-IP_PREFIX="172.30.0"
-IP_RANGE_START=10          # auto-assigned IPs start at 172.30.0.10
-IP_RANGE_END=250
+# All of these are overridable via environment so an isolated stack (e.g. the e2e test
+# suite) can run on its own network/subnet/name-prefix without touching a real fake-vm.
+# Unset = the historical defaults, so normal use is unaffected.
+IMAGE="${FAKE_VM_IMAGE:-openvidu-fake-vm:ubuntu-24.04}"
+NETWORK="${FAKE_VM_NETWORK:-fake-vm}"
+# NAME_PREFIX keys the container names (and the stop/list selectors below), so an isolated
+# prefix makes `stop --all` scoped to this stack only. Keep it free of glob metacharacters.
+NAME_PREFIX="${FAKE_VM_NAME_PREFIX:-fake-vm-}"
+SUBNET="${FAKE_VM_SUBNET:-172.30.0.0/16}"
+GATEWAY="${FAKE_VM_GATEWAY:-172.30.0.1}"
+IP_PREFIX="${FAKE_VM_IP_PREFIX:-172.30.0}"
+IP_RANGE_START="${FAKE_VM_IP_RANGE_START:-10}"   # auto-assigned IPs start at ${IP_PREFIX}.10
+IP_RANGE_END="${FAKE_VM_IP_RANGE_END:-250}"
 
 SSH_USER="ubuntu"
 SSH_HOME="/home/ubuntu"
@@ -76,6 +82,10 @@ KEY="${SCRIPT_DIR}/.ssh/id_ed25519"
 REGISTRY_SH="${SCRIPT_DIR}/registry.sh"
 FAKE_WEB_SH="${SCRIPT_DIR}/fake-web.sh"
 KNOWN_HOSTS="${SCRIPT_DIR}/.ssh/known_hosts"
+# The host ~/.ssh/config in which we manage a per-VM block. Overridable so tests never edit
+# the developer's real config (preferred over moving HOME, which would also relocate
+# ~/.docker/config.json and can break image pulls).
+SSH_CONFIG="${FAKE_VM_SSH_CONFIG:-${HOME}/.ssh/config}"
 DNS_SUFFIX="openvidu-local.dev"
 FW_CONF="/etc/fake-vm/firewall.conf"
 
@@ -101,12 +111,12 @@ usage() { awk 'NR>1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[
 # --- identity helpers: a fake-vm is identified by its IP -----------------------
 
 dashed()  { echo "${1//./-}"; }                     # 172.30.0.10 -> 172-30-0-10
-vm_name() { echo "fake-vm-$(dashed "$1")"; }        # -> fake-vm-172-30-0-10
+vm_name() { echo "${NAME_PREFIX}$(dashed "$1")"; }  # -> fake-vm-172-30-0-10
 vm_dns()  { echo "$(dashed "$1").${DNS_SUFFIX}"; }  # -> 172-30-0-10.openvidu-local.dev
 
 # fake-vm-172-30-0-10 / 172-30-0-10.openvidu-local.dev / 172.30.0.10 -> 172.30.0.10
 ip_from_arg() {
-    local a="$1"; a="${a#fake-vm-}"; a="${a%.${DNS_SUFFIX}}"; echo "${a//-/.}"
+    local a="$1"; a="${a#"${NAME_PREFIX}"}"; a="${a%."${DNS_SUFFIX}"}"; echo "${a//-/.}"
 }
 
 container_ip() {
@@ -318,7 +328,7 @@ ssh_block_begin() { echo "# >>> fake-vm $1 (managed) >>>"; }
 ssh_block_end()   { echo "# <<< fake-vm $1 (managed) <<<"; }
 
 remove_ssh_config_block() {
-    local ip="$1" cfg="${HOME}/.ssh/config"
+    local ip="$1" cfg="$SSH_CONFIG"
     [[ -f "$cfg" ]] || return 0
     sed -i "/^$(ssh_block_begin "$ip")\$/,/^$(ssh_block_end "$ip")\$/d" "$cfg"
     sed -i -e :a -e '/^\n*$/{$d;N;ba}' "$cfg" 2>/dev/null || true
@@ -326,8 +336,8 @@ remove_ssh_config_block() {
 
 write_ssh_config() {
     local ip="$1" name; name="$(vm_name "$ip")"
-    local cfg="${HOME}/.ssh/config"
-    mkdir -p "${HOME}/.ssh"; chmod 700 "${HOME}/.ssh" 2>/dev/null || true
+    local cfg="$SSH_CONFIG"
+    mkdir -p "$(dirname "$cfg")"; chmod 700 "$(dirname "$cfg")" 2>/dev/null || true
     touch "$cfg"; chmod 600 "$cfg" 2>/dev/null || true
 
     remove_ssh_config_block "$ip"
@@ -362,17 +372,41 @@ remove_known_hosts() {
     ssh-keygen -R "$ip"              -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true
 }
 
-# --- simulated perimeter firewall (ufw), driven over docker exec --------------
+# --- simulated perimeter firewall, driven over docker exec --------------------
 # Declarative model: the desired spec (default policy + open/close port sets) is
-# stored in the VM and every change resets ufw and reapplies from scratch, so
-# port reachability is unambiguous (no dependence on ufw rule ordering). Under
-# default-deny the open set becomes the only allow rules (closed = blocked by
-# default); under default-allow the close set becomes the only deny rules. All
-# ops run via docker exec — never SSH — and 22/tcp is always kept open.
+# stored in the VM and every change resets and reapplies from scratch, so port
+# reachability is unambiguous (no dependence on rule ordering). Under default-deny
+# the open set becomes the only allow rules (closed = blocked by default); under
+# default-allow the close set becomes the only deny rules. It has TWO parts, so it
+# also gates ports served by nested containers/pods, not just VM-bound ones:
+#   - ufw (INPUT)     — services bound on the VM itself (e.g. a plain listener)
+#   - FAKEVM-FWD chain — docker-published ports and k8s NodePorts, which are DNAT'd
+#                        and traverse FORWARD where ufw's INPUT rules never see them
+# All ops run via docker exec — never SSH — and 22/tcp is always kept open.
 
 _fw_ports() { echo "${1:-}" | tr ',' ' ' | xargs 2>/dev/null; }
 _set_add()  { echo "${1:-} ${2:-}" | tr ' ' '\n' | grep -v '^$' | sort -u | xargs 2>/dev/null; }
 _set_del()  { local out="" t; for t in ${1:-}; do case " ${2:-} " in *" $t "*) ;; *) out+="$t ";; esac; done; echo $out; }
+
+# _fw_fwd_match prints an iptables append for the FORWARD gating chain, matching EXTERNAL
+# (-i eth0) NEW ingress to a published port by its ORIGINAL pre-DNAT destination port (so it
+# catches docker -p publishes and k8s NodePorts alike). $1 chain, $2 RETURN|DROP, $3 port
+# token (N | N/tcp | N/udp); a bare N matches both tcp and udp, as ufw does.
+_fw_fwd_match() {
+    local c="$1" tgt="$2" tok="$3" proto num
+    case "$tok" in
+        */tcp) proto="tcp"; num="${tok%/tcp}" ;;
+        */udp) proto="udp"; num="${tok%/udp}" ;;
+        *)     proto="both"; num="$tok" ;;
+    esac
+    [[ "$num" =~ ^[0-9]+$ ]] || return 0
+    local base="iptables -A ${c} -i eth0 -m conntrack --ctstate NEW --ctorigdstport ${num}"
+    if [[ "$proto" == "both" ]]; then
+        echo "${base} -p tcp -j ${tgt}; ${base} -p udp -j ${tgt}; "
+    else
+        echo "${base} -p ${proto} -j ${tgt}; "
+    fi
+}
 
 _fw_load() {   # -> FW_DEF / FW_O / FW_C (defaults if no spec stored yet)
     FW_DEF="deny"; FW_O=""; FW_C=""
@@ -385,7 +419,12 @@ _fw_load() {   # -> FW_DEF / FW_O / FW_C (defaults if no spec stored yet)
 fw_apply() {   # $1 name  $2 default  $3 open  $4 close
     local name="$1" def="$2" open close; open="$(_fw_ports "${3:-}")"; close="$(_fw_ports "${4:-}")"
     [[ "$def" == "allow" ]] || def="deny"
-    local s="ufw --force reset >/dev/null; ufw default allow outgoing >/dev/null; "
+    # --- ufw (INPUT): gates services bound on the VM itself ---
+    # `logging off`: ufw's logging rules fail to load under a heavy iptables table (k3s adds
+    # thousands of rules) with "Could not load logging rules", which would make the command
+    # error out. Logging is inessential to a simulated firewall, so turn it off for robustness.
+    local s="ufw --force reset >/dev/null; ufw logging off >/dev/null 2>&1; "
+    s+="ufw default allow outgoing >/dev/null; "
     s+="ufw default ${def} incoming >/dev/null; ufw allow 22/tcp >/dev/null; "
     local p
     if [[ "$def" == "allow" ]]; then
@@ -393,7 +432,30 @@ fw_apply() {   # $1 name  $2 default  $3 open  $4 close
     else
         for p in $open; do s+="ufw allow ${p} >/dev/null; "; done
     fi
-    s+="ufw --force enable >/dev/null; mkdir -p $(dirname "$FW_CONF"); "
+    s+="ufw --force enable >/dev/null; "
+
+    # --- FORWARD gating: docker-published ports and k8s NodePorts ---
+    # Those are DNAT'd and traverse FORWARD, so ufw's INPUT rules never see them. A dedicated
+    # chain at the TOP of FORWARD applies the same open/close policy, matching only external
+    # ingress (-i eth0) NEW connections by their original pre-DNAT port — so container egress
+    # and inter-container / pod-to-pod traffic (other interfaces / ESTABLISHED) are untouched.
+    local C="FAKEVM-FWD"
+    s+="iptables -N ${C} 2>/dev/null || iptables -F ${C}; "
+    s+="iptables -D FORWARD -j ${C} 2>/dev/null; iptables -I FORWARD 1 -j ${C}; "
+    s+="iptables -A ${C} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN; "
+    if [[ "$def" == "allow" ]]; then
+        for p in $close; do
+            [[ "$p" == "22" || "$p" == "22/tcp" ]] && continue
+            s+="$(_fw_fwd_match "$C" DROP "$p")"
+        done
+    else
+        for p in $open; do s+="$(_fw_fwd_match "$C" RETURN "$p")"; done
+        # default-deny: drop every other NEW external ingress to a forwarded service
+        s+="iptables -A ${C} -i eth0 -p tcp -m conntrack --ctstate NEW -j DROP; "
+        s+="iptables -A ${C} -i eth0 -p udp -m conntrack --ctstate NEW -j DROP; "
+    fi
+
+    s+="mkdir -p $(dirname "$FW_CONF"); "
     s+="printf 'default=%s\nopen=%s\nclose=%s\n' '${def}' '${open}' '${close}' > ${FW_CONF}"
     docker exec "$name" bash -c "$s"
 }
@@ -415,15 +477,42 @@ fw_close() {
 }
 
 fw_default() { local name="$1" def="$2"; _fw_load "$name"; fw_apply "$name" "$def" "$FW_O" "$FW_C"; }
-fw_disable() { docker exec "$1" bash -c "ufw --force reset >/dev/null; ufw --force disable >/dev/null; rm -f ${FW_CONF}"; }
-fw_status()  { docker exec "$1" ufw status verbose 2>/dev/null; }
+fw_disable() {
+    docker exec "$1" bash -c "ufw --force reset >/dev/null; ufw --force disable >/dev/null; \
+        iptables -D FORWARD -j FAKEVM-FWD 2>/dev/null; iptables -F FAKEVM-FWD 2>/dev/null; \
+        iptables -X FAKEVM-FWD 2>/dev/null; rm -f ${FW_CONF}"
+}
+
+# fw_status shows ONE consistent view. The stored spec (FW_CONF) is the single source of truth
+# that fw_apply programs into BOTH ufw (INPUT — VM-bound services) and the FAKEVM-FWD iptables
+# chain (FORWARD — docker-published / k8s NodePort ports), so the port list here reflects
+# reachability no matter how a port is served. ufw's own detail (host services) follows.
+fw_status() {
+    local name="$1"
+    if docker exec "$name" test -f "$FW_CONF" 2>/dev/null; then
+        _fw_load "$name"
+        if [[ "$FW_DEF" == "deny" ]]; then
+            echo "firewall: ON — default-deny; only these ports are reachable (VM-bound AND container/NodePort), plus 22/tcp:"
+            echo "  open:   ${FW_O:-<none>}"
+        else
+            echo "firewall: ON — default-allow; everything reachable except these (VM-bound AND container/NodePort):"
+            echo "  closed: ${FW_C:-<none>}"
+        fi
+        echo
+    fi
+    echo "ufw detail (host-bound services):"
+    docker exec "$name" ufw status verbose 2>/dev/null | sed 's/^/  /' || true
+    return 0
+}
 
 # ==============================================================================
 # Commands
 # ==============================================================================
 
 cmd_start() {
-    local runtime_mode="auto" want_ip="" verify="" fw_mode="" fw_open_l="" fw_close_l=""
+    # FAKE_VM_RUNTIME sets the default runtime (auto|privileged|sysbox); an explicit
+    # --runtime below still overrides it. Lets an isolated/CI stack force 'privileged'.
+    local runtime_mode="${FAKE_VM_RUNTIME:-auto}" want_ip="" verify="" fw_mode="" fw_open_l="" fw_close_l=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --runtime)     runtime_mode="${2:?}"; shift 2 ;;
@@ -583,8 +672,8 @@ registry_summary() {
 # configured inside the VM for it: it is reachable by IP, and over HTTPS on its public
 # openvidu-local.dev name, from the VM and from any container or pod in it.
 fake_web_summary() {
-    if vm_running "fake-vm-web"; then
-        echo "http://172.30.0.4/ · https://172-30-0-4.openvidu-local.dev/"
+    if vm_running "${NAME_PREFIX}web"; then
+        echo "http://${IP_PREFIX}.4/ · https://$(dashed "${IP_PREFIX}.4").${DNS_SUFFIX}/"
     else
         echo "not running; serve unreleased artifacts with $(basename "$FAKE_WEB_SH") up"
     fi
@@ -646,6 +735,7 @@ cmd_stop() {
         info "removing fake-vm ${ip} (${name}) ..."
         docker stop -t 15 "$name" >/dev/null 2>&1 || true
         docker rm -f "$name" >/dev/null 2>&1 || true
+        # shellcheck disable=SC2046  # vm_volumes intentionally expands to two volume names
         docker volume rm $(vm_volumes "$name") >/dev/null 2>&1 || true
         remove_ssh_config_block "$ip"; remove_known_hosts "$ip"
         info "removed ${ip} and its SSH credentials"
@@ -654,8 +744,8 @@ cmd_stop() {
     if [[ -n "$all" ]]; then
         # IP-named containers only: the shared infrastructure on this network (registries,
         # fake web) is not a VM and is torn down by its own script, below.
-        local ips; ips="$(docker ps -a --filter "name=^fake-vm-" --format '{{.Names}}' \
-            | { grep -E '^fake-vm-[0-9]+-[0-9]+-[0-9]+-[0-9]+$' || true; } \
+        local ips; ips="$(docker ps -a --filter "name=^${NAME_PREFIX}" --format '{{.Names}}' \
+            | { grep -E "^${NAME_PREFIX}[0-9]+-[0-9]+-[0-9]+-[0-9]+$" || true; } \
             | while read -r n; do ip_from_arg "$n"; done)"
         if [[ -z "$ips" ]]; then info "no fake-vm containers found"; else
             while read -r ip; do [[ -n "$ip" ]] && stop_one "$ip"; done <<< "$ips"
@@ -727,8 +817,8 @@ cmd_certs() {
 # only_running_vm_ip echoes the IP of the single running fake-vm, or nothing when there
 # is none or more than one.
 only_running_vm_ip() {
-    local names; names="$(docker ps --filter "name=^fake-vm-" --format '{{.Names}}' 2>/dev/null \
-        | { grep -E '^fake-vm-[0-9]+-[0-9]+-[0-9]+-[0-9]+$' || true; })"
+    local names; names="$(docker ps --filter "name=^${NAME_PREFIX}" --format '{{.Names}}' 2>/dev/null \
+        | { grep -E "^${NAME_PREFIX}[0-9]+-[0-9]+-[0-9]+-[0-9]+$" || true; })"
     [[ "$(echo "$names" | grep -c .)" == "1" ]] || return 0
     ip_from_arg "$names"
 }
@@ -736,8 +826,8 @@ only_running_vm_ip() {
 cmd_list() {
     # IP-named containers only: the shared infrastructure on this network (the registries,
     # the fake web server) is not a VM, so it does not belong in this listing.
-    local names; names="$(docker ps --filter "name=^fake-vm-" --format '{{.Names}}' \
-        | { grep -E '^fake-vm-[0-9]+-[0-9]+-[0-9]+-[0-9]+$' || true; } | sort -V)"
+    local names; names="$(docker ps --filter "name=^${NAME_PREFIX}" --format '{{.Names}}' \
+        | { grep -E "^${NAME_PREFIX}[0-9]+-[0-9]+-[0-9]+-[0-9]+$" || true; } | sort -V)"
     if [[ -z "$names" ]]; then echo "no running fake-vms"; return 0; fi
     printf "%-16s %-30s %-10s %s\n" "IP" "DNS" "RUNTIME" "STATUS"
     local n ip st fw
@@ -768,4 +858,7 @@ main() {
     esac
 }
 
-main "$@"
+# Run main only when executed directly, not when sourced (e.g. by the test suite).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -9,3 +9,5 @@ www/
 # expires and renews, so it is never versioned).
 fullchain.pem
 privkey.pem
+# Vendored bats-core + helpers (see `make bootstrap`); a system bats is used otherwise.
+tests/e2e/libs/

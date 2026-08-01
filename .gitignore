@@ -4,3 +4,8 @@
 .cache/
 # Artifacts you drop in to be served by fake-web.sh — never part of the repo.
 www/
+# The wildcard certificate for *.openvidu-local.dev, downloaded automatically by
+# fake-vm.sh from https://certs.openvidu-local.dev (a real Let's Encrypt pair that
+# expires and renews, so it is never versioned).
+fullchain.pem
+privkey.pem

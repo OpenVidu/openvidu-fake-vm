@@ -22,7 +22,8 @@ Features that simulate a typical remote machine:
   from the machines, to serve artifacts that are not published anywhere yet.
 
 Nothing needs installing: clone the repo and run the scripts. The only
-requirement on the host is **Docker**.
+requirement on the host is **Docker** (plus `curl` or `wget` for the HTTPS
+certificate — without them the scripts degrade to HTTP-only).
 
 > [!IMPORTANT]
 > **Only tested on Linux**, with Docker Engine on a Linux host. The whole design assumes
@@ -161,7 +162,9 @@ shell — the wrapper connects with no configuration whatsoever:
 `*.openvidu-local.dev` is a public wildcard DNS alias that resolves
 `a-b-c-d.openvidu-local.dev` → `a.b.c.d`, so a VM's DNS name resolves to its
 container IP from the host with no `/etc/hosts` edits. A matching wildcard TLS
-certificate is bundled for serving HTTPS on those names:
+certificate is downloaded automatically from `https://certs.openvidu-local.dev/`
+every time it is needed (`start`, `certs`, `fake-web.sh up`), landing next to the
+scripts (git-ignored):
 
 - Private key: `privkey.pem`
 - Full-chain certificate: `fullchain.pem`
@@ -194,8 +197,10 @@ Those example flags are the [OpenVidu CLI](https://openvidu.io)'s, since that is
 this tool was built to test — but the certificate is not tied to it: anything that takes
 a domain plus a certificate/key path is configured the same way.
 
-The certificate does expire. When it is missing or out of date, the same command says so
-and prints the `curl` lines that fetch a fresh pair from `https://certs.openvidu-local.dev/`.
+The certificate does expire, but renewal is automatic: every use re-downloads the pair
+from `https://certs.openvidu-local.dev/`. When the download fails, a valid local copy
+keeps being used (with a warning); without one, the same command prints the manual
+`curl` lines to fetch the pair yourself.
 
 ## Container registries (transparent cache + local images)
 
@@ -288,8 +293,8 @@ from a pod, and from the host:
 
 ```
 http://172.30.0.4/<path>                        plain HTTP, nothing to trust
-https://172-30-0-4.openvidu-local.dev/<path>    HTTPS with the bundled PUBLICLY trusted
-                                                wildcard certificate (see DNS & TLS below)
+https://172-30-0-4.openvidu-local.dev/<path>    HTTPS with the auto-downloaded PUBLICLY
+                                                trusted wildcard certificate (see DNS & TLS)
 ```
 
 That second URL is the interesting one: the certificate is a real, publicly-trusted
@@ -312,8 +317,9 @@ you point that configuration at one of the URLs above.
 ```
 
 Artifacts live in `www/` (git-ignored) and survive `stop`. `fake-vm.sh stop --all --prune`
-removes the server along with the network, but keeps the artifacts. If the bundled
-certificate is missing or expired, `up` says so and serves HTTP only.
+removes the server along with the network, but keeps the artifacts. `up` downloads and
+refreshes the certificate automatically; if the download fails and no valid local copy
+exists, it says so and serves HTTP only.
 
 ## Using it from another project
 
@@ -332,7 +338,7 @@ Two paths inside the checkout are the ones consumers need:
 | Path | What it is |
 |---|---|
 | `.ssh/id_ed25519` | the private key that logs into every VM as `ubuntu` (generated on the first `start`) |
-| `fullchain.pem` / `privkey.pem` | the publicly-trusted wildcard certificate for `*.openvidu-local.dev` |
+| `fullchain.pem` / `privkey.pem` | the publicly-trusted wildcard certificate for `*.openvidu-local.dev` (downloaded automatically) |
 
 ## How it works
 

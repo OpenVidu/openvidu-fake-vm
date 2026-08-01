@@ -13,9 +13,9 @@
 # pod, and from the host:
 #
 #   http://172.30.0.4/<path>                        plain HTTP, nothing to trust
-#   https://172-30-0-4.openvidu-local.dev/<path>    HTTPS with the bundled PUBLICLY
-#                                                   trusted wildcard certificate for
-#                                                   *.openvidu-local.dev (see README)
+#   https://172-30-0-4.openvidu-local.dev/<path>    HTTPS with the auto-downloaded
+#                                                   PUBLICLY trusted wildcard certificate
+#                                                   for *.openvidu-local.dev (see README)
 #
 # It deliberately does NOT impersonate real hostnames (no /etc/hosts or DNS tricks) and
 # installs no CA anywhere: a nested container or a pod would trust neither, and rewiring
@@ -42,9 +42,11 @@ WEB_IMAGE="${FAKE_WEB_IMAGE:-caddy:2-alpine}"
 WEB_ROOT="${FAKE_WEB_ROOT:-${SCRIPT_DIR}/www}"
 STATE_DIR="${SCRIPT_DIR}/.cache/fake-web"
 CADDYFILE="${STATE_DIR}/Caddyfile"
+FAKE_VM_SH="${SCRIPT_DIR}/fake-vm.sh"
 
-# The bundled publicly-trusted wildcard for *.openvidu-local.dev, and the name it covers
-# for this IP (that public DNS alias resolves a-b-c-d.openvidu-local.dev → a.b.c.d).
+# The publicly-trusted wildcard for *.openvidu-local.dev (downloaded and refreshed by
+# fake-vm.sh — see `fake-vm.sh certs`), and the name it covers for this IP (that public
+# DNS alias resolves a-b-c-d.openvidu-local.dev → a.b.c.d).
 LOCAL_FULLCHAIN="${SCRIPT_DIR}/fullchain.pem"
 LOCAL_PRIVKEY="${SCRIPT_DIR}/privkey.pem"
 LOCAL_NAME="${WEB_IP//./-}.openvidu-local.dev"
@@ -55,8 +57,8 @@ info() { echo ">>> $*"; }
 running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]; }
 exists()  { docker inspect "$1" >/dev/null 2>&1; }
 
-# https_available is false when the bundled certificate is missing (it is a real
-# Let's Encrypt certificate and does expire) — the server then serves HTTP only.
+# https_available is false when the certificate is missing (its download can fail —
+# no network, no curl/wget) — the server then serves HTTP only.
 https_available() { [[ -f "$LOCAL_FULLCHAIN" && -f "$LOCAL_PRIVKEY" ]]; }
 
 # auto_https is off: no ACME and no HTTP→HTTPS redirect (whatever you are testing may use
@@ -114,6 +116,9 @@ cmd_up() {
     [[ $# -eq 0 ]] || { err "unknown up option: $1"; return 2; }
 
     mkdir -p "$STATE_DIR" "$WEB_ROOT"
+    # The certificate pair is managed by fake-vm.sh (downloaded fresh on every use);
+    # refresh it here so a fresh checkout gets HTTPS from `up` alone.
+    [[ -x "$FAKE_VM_SH" ]] && "$FAKE_VM_SH" certs --ensure || true
     https_available || err "no ${LOCAL_FULLCHAIN##*/}/${LOCAL_PRIVKEY##*/} — serving HTTP only"
     write_caddyfile
 
@@ -178,7 +183,7 @@ cmd_status() {
     if https_available; then
         echo "HTTPS URL:      https://${LOCAL_NAME}/   (publicly trusted certificate)"
     else
-        echo "HTTPS URL:      unavailable (bundled certificate missing)"
+        echo "HTTPS URL:      unavailable (certificate missing — rerun: $0 up)"
     fi
 }
 

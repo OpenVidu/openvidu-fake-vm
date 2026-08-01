@@ -16,8 +16,9 @@
 #   stop  <IP|name> | --all     stop + remove a VM (and its SSH credentials)
 #   firewall <IP> <action>      manage a running VM's simulated firewall
 #   ssh   <IP|name> [cmd...]    ssh into a VM (as the ubuntu user)
-#   certs [IP|name]             print the paths of the bundled HTTPS certificate for
-#                               *.openvidu-local.dev, ready to copy-paste
+#   certs [IP|name]             download/refresh the HTTPS certificate for
+#                               *.openvidu-local.dev and print its paths, ready to
+#                               copy-paste
 #   list                        list running fake-vms
 #   help                        show this help
 #
@@ -78,11 +79,14 @@ KNOWN_HOSTS="${SCRIPT_DIR}/.ssh/known_hosts"
 DNS_SUFFIX="openvidu-local.dev"
 FW_CONF="/etc/fake-vm/firewall.conf"
 
-# The bundled wildcard certificate for *.openvidu-local.dev (also used by fake-web.sh).
-# Absolute paths on purpose: they are printed to be pasted into a command run from
-# anywhere, not only from this directory.
+# The wildcard certificate for *.openvidu-local.dev (also used by fake-web.sh),
+# downloaded automatically on every use — a real Let's Encrypt pair that renews over
+# time, so it is never versioned. Absolute paths on purpose: they are printed to be
+# pasted into a command run from anywhere, not only from this directory.
 CERT_FULLCHAIN="${SCRIPT_DIR}/fullchain.pem"
 CERT_PRIVKEY="${SCRIPT_DIR}/privkey.pem"
+# FAKE_VM_CERT_URL overrides the download endpoint (useful to simulate outages).
+CERT_BASE_URL="${FAKE_VM_CERT_URL:-https://certs.${DNS_SUFFIX}}"
 
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no
           -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
@@ -169,11 +173,12 @@ ensure_host_modules() {
     fi
 }
 
-# --- bundled TLS certificate for *.openvidu-local.dev --------------------------
+# --- TLS certificate for *.openvidu-local.dev ----------------------------------
 # A real, publicly-trusted Let's Encrypt wildcard, so anything served on a VM's
 # <ip-with-dashes>.openvidu-local.dev name gets HTTPS every client already trusts —
 # no CA to install, no `-k`, no /etc/hosts entry. It is a real certificate, so it
-# does expire and may be missing from a checkout.
+# does expire: every command that uses it re-downloads the pair from CERT_BASE_URL
+# (certs_ensure), and a failed download falls back to the local copy.
 
 certs_available() { [[ -f "$CERT_FULLCHAIN" && -f "$CERT_PRIVKEY" ]]; }
 
@@ -191,16 +196,70 @@ certs_validity() {
     fi
 }
 
-# certs_missing_banner explains where the certificate is expected and how to get it back
-# (it is a real Let's Encrypt pair, kept in the repo and refreshed when it expires).
+# fetch_url downloads $1 to $2 with curl (or wget as fallback). The caller is
+# responsible for atomicity (download to a temp path, then mv).
+fetch_url() {
+    local url="$1" dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 5 --max-time 60 "$url" -o "$dest"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 10 -O "$dest" "$url"
+    else
+        err "neither curl nor wget available to download ${url}"; return 1
+    fi
+}
+
+# certs_fetch downloads the pair atomically: both files into a temp dir on the same
+# filesystem, sanity-checked, then moved into place together — a broken connection can
+# never leave a corrupt or mismatched pair behind.
+certs_fetch() {
+    local tmpdir
+    mkdir -p "${SCRIPT_DIR}/.cache"
+    tmpdir="$(mktemp -d "${SCRIPT_DIR}/.cache/certs.XXXXXX")" || return 1
+    if fetch_url "${CERT_BASE_URL}/fullchain.pem" "${tmpdir}/fullchain.pem" \
+       && fetch_url "${CERT_BASE_URL}/privkey.pem" "${tmpdir}/privkey.pem" \
+       && grep -q -- "-----BEGIN CERTIFICATE-----" "${tmpdir}/fullchain.pem" \
+       && grep -q -- "PRIVATE KEY-----" "${tmpdir}/privkey.pem"; then
+        chmod 644 "${tmpdir}/fullchain.pem"; chmod 600 "${tmpdir}/privkey.pem"
+        mv -f "${tmpdir}/fullchain.pem" "$CERT_FULLCHAIN"
+        mv -f "${tmpdir}/privkey.pem"   "$CERT_PRIVKEY"
+        rmdir "$tmpdir"; return 0
+    fi
+    rm -rf "$tmpdir"; return 1
+}
+
+# certs_ensure refreshes the pair from CERT_BASE_URL. Called by every command that
+# uses the certificate, so it is always as fresh as the network allows. A failed
+# download degrades gracefully: keep a usable local copy (warning), otherwise the
+# callers fall back to certs_missing_banner / HTTP-only. Never fails the caller.
+certs_ensure() {
+    info "refreshing the HTTPS certificate for *.${DNS_SUFFIX} from ${CERT_BASE_URL} ..."
+    local validity
+    if certs_fetch; then
+        validity="$(certs_validity)"
+        info "certificate downloaded${validity:+ (${validity})}"
+    elif certs_available; then
+        validity="$(certs_validity)"
+        err "could not download a fresh certificate — keeping the local copy${validity:+ (${validity})}"
+    else
+        err "could not download the HTTPS certificate from ${CERT_BASE_URL}"
+    fi
+    return 0
+}
+
+# certs_missing_banner explains where the certificate lives and how to retry when the
+# automatic download (certs_ensure) could not fetch it.
 certs_missing_banner() {
     cat <<EOF
-HTTPS certificate for *.${DNS_SUFFIX}: NOT bundled in this checkout. Expected at:
+HTTPS certificate for *.${DNS_SUFFIX}: not available (automatic download from
+${CERT_BASE_URL} failed — no network?). Expected at:
   ${CERT_FULLCHAIN}
   ${CERT_PRIVKEY}
-Download a fresh pair with:
-  curl -fsSL https://certs.${DNS_SUFFIX}/fullchain.pem -o ${CERT_FULLCHAIN}
-  curl -fsSL https://certs.${DNS_SUFFIX}/privkey.pem   -o ${CERT_PRIVKEY}
+Retry with:
+  $0 certs
+or download it manually:
+  curl -fsSL ${CERT_BASE_URL}/fullchain.pem -o ${CERT_FULLCHAIN}
+  curl -fsSL ${CERT_BASE_URL}/privkey.pem   -o ${CERT_PRIVKEY}
 EOF
 }
 
@@ -387,6 +446,7 @@ cmd_start() {
 
     command -v docker >/dev/null 2>&1 || { err "docker not found"; return 1; }
     ensure_key; ensure_image; ensure_network; ensure_host_modules
+    certs_ensure
 
     local ip; ip="${want_ip:-$(pick_free_ip)}"
     local name; name="$(vm_name "$ip")"
@@ -642,16 +702,25 @@ cmd_ssh() {
         -o LogLevel=ERROR "${SSH_USER}@${ip}" "$@"
 }
 
-# cmd_certs prints the bundled HTTPS certificate paths, ready to copy-paste. With no
-# argument it fills the domain in from the only running VM (if there is exactly one),
-# so the common case needs no typing at all.
+# cmd_certs refreshes the HTTPS certificate and prints its paths, ready to copy-paste.
+# With no argument it fills the domain in from the only running VM (if there is exactly
+# one), so the common case needs no typing at all.
 cmd_certs() {
-    local ip=""
-    case "${1:-}" in
-        -h|--help) usage; return 0 ;;
-        "")        ip="$(only_running_vm_ip)" ;;
-        *)         ip="$(ip_from_arg "$1")" ;;
-    esac
+    local ip="" ensure_only=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage; return 0 ;;
+            --ensure)  ensure_only=1; shift ;;   # fetch only, no banner (used by fake-web.sh)
+            -*)        err "unknown certs option: $1"; return 2 ;;
+            *)         ip="$(ip_from_arg "$1")"; shift ;;
+        esac
+    done
+    certs_ensure
+    if [[ -n "$ensure_only" ]]; then
+        certs_available || return 1
+        return 0
+    fi
+    [[ -n "$ip" ]] || ip="$(only_running_vm_ip)"
     certs_banner "$ip"
 }
 

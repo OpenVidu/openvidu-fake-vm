@@ -48,14 +48,8 @@ jobs:
         run: bash .github/install-sysbox.sh
       - name: Vendor bats
         run: make bootstrap
-      - name: Build VM image (cached)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          tags: openvidu-fake-vm:ci
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Build VM image
+        run: docker build -t openvidu-fake-vm:ci .
       - name: Smoke tier
         run: E2E_TIER=smoke tests/e2e/run.sh
       - name: Cleanup
@@ -83,14 +77,8 @@ jobs:
         run: bash .github/install-sysbox.sh
       - name: Vendor bats
         run: make bootstrap
-      - name: Build VM image (cached)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          tags: openvidu-fake-vm:ci
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Build VM image
+        run: docker build -t openvidu-fake-vm:ci .
       - name: Full tier
         run: E2E_TIER=full tests/e2e/run.sh
       - name: Cleanup

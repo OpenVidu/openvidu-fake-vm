@@ -7,8 +7,8 @@
 load '../test_helper'
 
 export FAKE_VM_NO_REGISTRY=1
-NAME_10="fake-vm-e2e-172-31-99-10"
-NAME_11="fake-vm-e2e-172-31-99-11"
+NAME_10="$(vm_container 172.31.99.10)"         # honours FAKE_VM_NAME_PREFIX (e.g. CI's)
+NAME_11="$(vm_container 172.31.99.11)"
 
 setup_file() {
     require_e2e

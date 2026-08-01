@@ -8,7 +8,7 @@ load '../test_helper'
 
 export FAKE_VM_NO_REGISTRY=1
 E2E_IP="172.31.99.12"
-E2E_NAME="fake-vm-e2e-172-31-99-12"
+E2E_NAME="$(vm_container "$E2E_IP")"           # honours FAKE_VM_NAME_PREFIX (e.g. CI's)
 PORT=8080
 
 setup_file() {

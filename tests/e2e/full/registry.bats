@@ -8,7 +8,7 @@
 load '../test_helper'
 
 E2E_IP="172.31.99.15"
-E2E_NAME="fake-vm-e2e-172-31-99-15"
+E2E_NAME="$(vm_container "$E2E_IP")"           # honours FAKE_VM_NAME_PREFIX (e.g. CI's)
 LOCAL_IMAGE="e2e-local/tiny:dev"
 
 setup_file() {

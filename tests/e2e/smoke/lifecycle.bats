@@ -9,7 +9,7 @@ load '../test_helper'
 
 export FAKE_VM_NO_REGISTRY=1     # this file does not exercise the registries; skip the pull
 E2E_IP="172.31.99.10"
-E2E_NAME="fake-vm-e2e-172-31-99-10"
+E2E_NAME="$(vm_container "$E2E_IP")"           # honours FAKE_VM_NAME_PREFIX (e.g. CI's)
 E2E_DNS="172-31-99-10.openvidu-local.dev"
 
 setup_file() {

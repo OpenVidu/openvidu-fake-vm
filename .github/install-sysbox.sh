@@ -32,4 +32,18 @@ for _ in $(seq 1 20); do
 done
 
 docker info --format '{{range .Runtimes}}{{println .}}{{end}}' | grep -qw sysbox-runc
-echo "sysbox-runc registered (v${ver})."
+echo "sysbox-runc registered (v${ver}); waiting for it to become ready ..."
+
+# The runtime shows up in `docker info` before sysbox-mgr/sysbox-fs are actually ready to
+# launch a container (especially right after the docker restart). Warm up: pull a tiny image
+# and launch a throwaway sysbox container until it succeeds, so the tests never race sysbox.
+docker pull -q alpine:latest >/dev/null 2>&1 || true
+for _ in $(seq 1 40); do
+    if docker run --rm --runtime=sysbox-runc alpine:latest true >/dev/null 2>&1; then
+        echo "sysbox is ready."
+        exit 0
+    fi
+    sleep 3
+done
+echo "sysbox-runc is registered but a warmup container never launched" >&2
+exit 1
